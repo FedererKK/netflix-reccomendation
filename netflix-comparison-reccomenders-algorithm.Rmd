@@ -1,0 +1,266 @@
+
+```{r eval=FALSE}
+#func to check if library is installed, in not install it
+check.packages <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+```
+
+```{r eval=FALSE}
+packageList<-c("ggplot2", "data.table", "reshape2", "recommenderlab", "recosystem",'dplyr','here','ggplot2','par')
+check.packages(packageList)
+```
+
+```{r}
+#Load required libraries
+library(recommenderlab)
+library(ggplot2)                       
+library(data.table)
+library(reshape2)
+library(dplyr)
+library(here)
+library(ggplot2)
+```
+
+```{r}
+#Use fread to process data faster
+movie_data <- data.table::fread("data/ml-latest/movies.csv",stringsAsFactors=FALSE)
+rating_data <- data.table::fread("data/ml-latest/ratings.csv")
+```
+
+```{r}
+#Check number of duplicate items
+length(movie_data$movieId) - length(unique(movie_data$movieId)) 
+length(movie_data$title) - length(unique(movie_data$title)) 
+```
+
+The first operation returns 0, which means there are no duplicate movieID. However the second returns a number greater than zero, which means some movie with the same title might have different ID. Let's look for them.
+
+```{r}
+#Check if movie with same titles are represented with different IDs
+repeatMovies <- which(table(movie_data$title) > 1)
+head(repeatMovies,5)
+```
+
+Example of movies with same title and different movieID. Also note that Genre is different as well
+
+ID 5264 | Title Clockstoppers (2002) | Genre Action|Adventure|Sci-Fi|Thriller
+ID 144426 | Title Clockstoppers (2002) | Genre Adventure|Children|Sci-Fi|Thriller
+
+For simplicity I will remove all duplicate instances.
+
+```{r}
+#remove all duplicate items based on column 'title'
+movie_data <- unique(movie_data, by='title') 
+
+#Check again if movies with duplicate titles have been removed
+repeatMovies <- which(table(movie_data$title) > 1)
+repeatMovies
+```
+
+There are not anymore movies with the same title now.
+
+Let's have a look at ratings data now.
+
+```{r}
+#rating_data %>% group_by(userId) %>% count(movieId) %>% filter(n>1)
+```
+There are no duplicates eg. the same user did not rate the same movie more than once
+
+```{r}
+not_rated <- setdiff(unique(movie_data$movieId), unique(rating_data$movieId)) #movies not rated by any user 
+
+#I will remove these movies as they can not be used as input to our reccomender.
+
+'%ni%' <- Negate('%in%') #Function that works in the opposite way of %in%.
+
+movie_len1 <- length(movie_data$movieId)
+movie_data <- movie_data[movieId %ni% not_rated]
+movie_len2 <- length(movie_data$movieId)
+movie_delta <- movie_len1 - movie_len2
+```
+
+There were initially `r movie_len1` movies, and `r movie_delta` movies had no reviews thus were eliminated.
+
+```{r}
+genres_all <- unique(movie_data[1:10000]$genres)
+genres <- c()
+
+#function to generates list of all genress using those in the first Nth movies.
+for (i in genres_all) {
+  i <- strsplit(i, split = "\\|") #break on escape char
+  genres <- append(genres, i[[1]])
+}
+
+genres <- unlist(unique(as.list(unlist(genres)))) #unlist and re-list to get data at same levels, and then only get unique values
+
+genres <- data.frame(genres)
+```
+
+
+## Item Based CF
+
+First of all we normalize ratings data as we want to remove rating bias from those users who always give very high or very low ratings.
+
+```{r}
+rating_data <- head(rating_data,2500000)
+```
+
+
+```{r}
+ratingMatrix <- dcast.data.table(rating_data, userId~movieId, value.var = "rating")
+ratingMatrix <- as.matrix(ratingMatrix[,-1])
+
+dim(ratingMatrix) 
+
+#setdiff(movie_data$movieId, as.integer(colnames(ratingMatrix)))
+
+#We cast the matrix to type 'realRatingMatrix which will later be fed to the recommender object
+ratingMatrix <- as(ratingMatrix, "realRatingMatrix")
+
+
+```
+
+
+```{r}
+user_similarity <- similarity(ratingMatrix[1:6, ],
+                             method = "cosine",
+                             which = "users")
+
+user_similarity
+```
+
+
+```{r}
+movie_ratings <- ratingMatrix[rowCounts(ratingMatrix) > 400,
+                              colCounts(ratingMatrix) > 400] 
+## If we changed this number the performance of the final model is likely to change as well. For very small numbers the performance will go down. When sample if limited large numbers (instead of 50) will also decrease performance
+movie_ratings 
+
+minimum_movies<- quantile(rowCounts(movie_ratings), 0.99)
+minimum_users <- quantile(colCounts(movie_ratings), 0.99)
+
+image(movie_ratings[rowCounts(movie_ratings) > minimum_movies,
+                    colCounts(movie_ratings) > minimum_users],
+      main = "Heatmap of the top users and movies")
+```
+```{r}
+average_ratings <- rowMeans(movie_ratings)
+qplot(average_ratings, fill=I("steelblue"), col=I("red")) +
+  ggtitle("Distribution of the average rating per user")
+```
+
+```{r}
+normalized_ratings <- normalize(movie_ratings)
+image(normalized_ratings[rowCounts(normalized_ratings) > minimum_movies,
+                         colCounts(normalized_ratings) > minimum_users],
+      main = "Normalized Ratings of the Top Users")
+
+normalized_ratings
+```
+
+```{r}
+#Create evaluation scheme to be used for validation
+scheme <- evaluationScheme(movie_ratings, 
+                           method="bootstrap", 
+                           k=5, 
+                           given=2, 
+                           goodRating=5)
+```
+
+
+```{r}
+##User Based Collaborative Filtering (UBCF) ##
+
+#Tuning for best distance method and best value for 'nn'
+
+algorithms_ubcf <- list("Cosine 30" = list(name="UBCF", param=list(normalize = "center", method="cosine", nn=30)),
+                   "Cosine 15" = list(name="UBCF", param=list(normalize = "center", method="cosine", nn=15)),
+                   "Pearson 30" = list(name="UBCF", param=list(normalize = "center", method="pearson", nn=30)),
+                   "Pearson 15" = list(name="UBCF", param=list(normalize = "center", method="pearson", nn=15)),
+                   "Jaccard 30" = list(name="UBCF", param=list(normalize = "center", method="jaccard", nn=30)),
+                   "Jaccard 15" = list(name="UBCF", param=list(normalize = "center", method="jaccard", nn=15)),
+                   "Z Cosine 30" = list(name="UBCF", param=list(normalize = "Z-score", method="cosine", nn=30)),
+                   "Z Cosine 15" = list(name="UBCF", param=list(normalize = "Z-score", method="cosine", nn=15)),
+                   "Z Pearson 30" = list(name="UBCF", param=list(normalize = "Z-score", method="pearson", nn=30)),
+                   "Z Pearson 15" = list(name="UBCF", param=list(normalize = "Z-score", method="pearson", nn=15)),
+                   "Z Jaccard 30" = list(name="UBCF", param=list(normalize = "Z-score", method="jaccard", nn=30)),
+                   "Z Jaccard 15" = list(name="UBCF", param=list(normalize = "Z-score", method="jaccard", nn=15))
+                   )
+
+ubcf_results_ratings <- evaluate(scheme, algorithms_ubcf, type='ratings')
+ubcf_results_topN <- evaluate(scheme, algorithms_ubcf, type = "topNList",   n=c(1,3,5,10,15,20))
+
+
+#Comparison of RMSE, MSE, and MAE for different UBCF recommender methods for the given evaluation scheme
+plot(ubcf_results_ratings, annotate = TRUE) + title('UBCF - Error rates')
+
+#Comparison  of  TPR/TNR  for different UBCF recommender  methods  for  the  given evaluation scheme.
+plot(ubcf_results_topN, annotate = TRUE) + title('UBCF - True Positive Rate VS True Negative Rate')
+
+#Comparison  of  ROC  curves  for  different UBCF  recommender  methods  for  the  given evaluation scheme.
+plot(ubcf_results_topN, "prec/rec",annotate = TRUE) + title('UBCF - Precision VS Recall')
+```
+
+When using Pearson distance with UBCF the algo takes half the time compared to Cosine and Jaccard.
+
+```{r}
+##Item Based Collaborative Filtering (IBCF) ##
+
+scheme_ibcf <- evaluationScheme(movie_ratings, 
+                           method="split", 
+                           train=0.9,
+                           given=3, 
+                           goodRating=5)
+
+#Tuning for best distance method and best value for 'k'
+
+algorithms_ibcf <- list("IBCF Cosine 30" = list(name="IBCF", param=list(normalize = "center", method="cosine", k=15)),
+                   "IBCF Pearson 30" = list(name="IBCF", param=list(normalize = "center", method="pearson", k=15)),
+                   "IBCF Jaccard 30" = list(name="IBCF", param=list(normalize = "center", method="jaccard", k=15)))
+
+ibcf_results_ratings <- evaluate(scheme_ibcf, algorithms_ibcf, type='ratings')
+ibcf_results_topN <- evaluate(scheme_ibcf, algorithms_ibcf, type = "topNList",   n=c(1,3,5,10,15,20))
+
+
+#Comparison of RMSE, MSE, and MAE for different IBCF recommender methods for the given evaluation scheme
+plot(ibcf_results_ratings, annotate = TRUE) + title('IBCF - Error rates')
+
+#Comparison  of  TPR/TNR  for different IBCF recommender  methods  for  the  given evaluation scheme.
+plot(ibcf_results_topN, annotate = TRUE) + title('IBCF - True Positive Rate VS True Negative Rate')
+
+#Comparison  of  ROC  curves  for  different IBCF  recommender  methods  for  the  given evaluation scheme.
+plot(ibcf_results_topN, "prec/rec",annotate = TRUE) + title('IBCF - Precision VS Recall')
+```
+
+When using Jaccard distance RMSE, MSE and MAE are all lower, however the other two plots reports a wierd behavior as if Jaccard failed to predict data (thus the zero TPR and FPR)
+
+
+```{r}
+##Matrix Based Collaborative Filtering (SVD) ##
+
+#Tuning for different value of 'k'
+
+algorithms_svd <- list("SVD 45" = list(name="SVD", param=list(k=45)),
+  "SVD 30" = list(name="SVD", param=list(k=30)),
+                   "SVD 15" = list(name="SVD", param=list(k=15)))
+
+
+svd_results_ratings <- evaluate(scheme, algorithms_svd, type='ratings')
+svd_results_topN <- evaluate(scheme, algorithms_svd, type = "topNList",   n=c(1,3,5,10,15,20))
+
+#Comparison of RMSE, MSE, and MAE for different IBCF recommender methods for the given evaluation scheme
+plot(svd_results_ratings, annotate = TRUE) + title('SVD - Error rates')
+
+#Comparison  of  TPR/TNR  for different IBCF recommender  methods  for  the  given evaluation scheme.
+plot(svd_results_topN, annotate = TRUE) + title('SVD - True Positive Rate VS True Negative Rate')
+
+#Comparison  of  ROC  curves  for  different IBCF  recommender  methods  for  the  given evaluation scheme.
+plot(svd_results_topN, "prec/rec",annotate = TRUE) + title('SVD - Precision VS Recall')
+```
+
+SVD with lower k performs better.
+
